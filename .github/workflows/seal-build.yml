@@ -1,0 +1,90 @@
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Space-separated Go test names to run instead of the full suite"
+        required: false
+        default: ""
+
+jobs:
+  build-test:
+    name: build and test (go ${{ matrix.go }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ["1.24.x", "1.25.x"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: false
+
+      - name: Go version
+        run: go version && go env
+
+      # The module zip is produced first, from the clean checkout, with Go's own
+      # golang.org/x/mod/zip.CreateFromDir (the proxy's inclusion rules). This
+      # seal workflow is not part of the upstream module, so .github is left out
+      # of the copy that gets zipped.
+      - name: Package module zip
+        if: matrix.go == '1.25.x'
+        run: |
+          mkdir -p "$RUNNER_TEMP/modsrc" "$RUNNER_TEMP/modhelper" "$RUNNER_TEMP/build_output"
+          rsync -a --exclude .git --exclude .github ./ "$RUNNER_TEMP/modsrc/"
+          cat > "$RUNNER_TEMP/modhelper/create_mod.go" <<'EOF'
+          package main
+
+          import (
+              "log"
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              m := module.Version{Path: os.Args[1], Version: os.Args[2]}
+              f, err := os.Create(os.Args[4])
+              if err != nil {
+                  log.Fatal(err)
+              }
+              defer f.Close()
+              if err := zip.CreateFromDir(f, m, os.Args[3]); err != nil {
+                  log.Fatal(err)
+              }
+              log.Printf("created module zip: %s", os.Args[4])
+          }
+          EOF
+          cd "$RUNNER_TEMP/modhelper"
+          go mod init example.com/modhelper
+          go get golang.org/x/mod/module golang.org/x/mod/zip
+          go run create_mod.go golang.org/x/net v0.45.0 "$RUNNER_TEMP/modsrc" "$RUNNER_TEMP/build_output/v0.45.0.zip"
+          unzip -l "$RUNNER_TEMP/build_output/v0.45.0.zip" | tail -1
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          if [ -n "$TEST_FILTER" ]; then
+            go test -v -run "^($(echo "$TEST_FILTER" | tr ' ' '|'))$" ./... 2>&1 | tee "$RUNNER_TEMP/scoped.log"
+            for t in $TEST_FILTER; do grep -qE "^=== RUN[[:space:]]+${t}(/|$)" "$RUNNER_TEMP/scoped.log" || { echo "selected test $t did not run"; exit 1; }; done
+          else
+            go test -v ./... 2>&1 | tee "$RUNNER_TEMP/full.log"
+            awk '/--- PASS/{p++} /--- FAIL/{f++} /--- SKIP/{s++} END{printf "TEST SUMMARY: %d passed, %d failed, %d skipped\n", p, f, s}' "$RUNNER_TEMP/full.log"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.go == '1.25.x'
+        with:
+          name: go-module-zip
+          path: ${{ runner.temp }}/build_output/v0.45.0.zip
+          if-no-files-found: error
